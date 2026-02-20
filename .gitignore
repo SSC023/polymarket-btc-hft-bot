@@ -1,0 +1,70 @@
+# =============================================================================
+# Polymarket HFT Bot - Git Ignore (CRITICAL: Protects private keys & secrets)
+# =============================================================================
+
+# --- CRITICAL: Never commit secrets ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+credentials/
+
+# --- Cursor IDE (contains local project state) ---
+.cursor/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Virtual environments ---
+venv/
+env/
+ENV/
+.venv/
+
+# --- Logs (may contain sensitive debug data) ---
+*.log
+bot_system.log
+logs/
+
+# --- Data exports (trade history, analytics) ---
+*.csv
+trade_history.csv
+data/
+
+# --- IDE & editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Testing & coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
