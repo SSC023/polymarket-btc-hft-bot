@@ -1,24 +1,30 @@
 """
-24/7 Market Discovery - Gamma API Scanner for BTC 15-minute markets.
-Polls Gamma API, finds active market, and switches to next when current ends.
+24/7 Market Discovery - Gamma API Scanner for Liquidity Rewards markets.
+Targets high-volume, longer-term markets (Crypto, Pop Culture) with rewards_min_size > 0.
+Skips short-term 15-minute markets.
 """
 
 import json
 import logging
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
 
-from config import GAMMA_EVENTS_URL, GAMMA_API_URL, BTC_15M_SLUG
+from config import GAMMA_EVENTS_URL, GAMMA_API_URL
 
 logger = logging.getLogger(__name__)
+
+# Preferred tags for market making (high volume, longer-term)
+PREFERRED_TAG_SLUGS = frozenset({"crypto", "bitcoin", "ethereum", "pop-culture", "entertainment", "sports"})
+
+# Title patterns to EXCLUDE (short-term markets)
+EXCLUDE_PATTERNS = ("15-minute", "15 minute", "5-minute", "1-hour", "1 hour", "hourly")
 
 
 @dataclass
 class ActiveMarket:
-    """Represents the current active BTC 15m market."""
+    """Represents a market with liquidity rewards."""
 
     event_id: str
     event_slug: str
@@ -28,81 +34,38 @@ class ActiveMarket:
     yes_token_id: str
     no_token_id: str
     accepting_orders: bool
+    rewards_min_size: int
 
 
 class Scanner:
     """
-    Polls Gamma API for BTC 15-minute Up/Down markets.
-    Search: tag 'Bitcoin' + '15-minute' in title, or slug 'bitcoin-price-15-minute'.
+    Polls Gamma API for markets with liquidity rewards.
+    Filters: rewards_min_size > 0, active, skip short-term, prefer Crypto/Pop Culture.
     """
 
-    POLL_INTERVAL = 30  # seconds
+    POLL_INTERVAL = 60  # seconds
     REQUEST_TIMEOUT = 15
 
     def __init__(self):
-        self._last_event_data: Optional[dict] = None
         self._last_market: Optional[ActiveMarket] = None
 
-    def _fetch_events(self, slug: Optional[str] = None, tag_slug: Optional[str] = None) -> list:
-        """Fetch events from Gamma API with optional filters."""
+    def _fetch_events(self, limit: int = 100, order: str = "volume_24hr") -> list:
+        """Fetch active events from Gamma API, sorted by volume."""
         params = {
             "active": "true",
             "closed": "false",
-            "limit": 100,
+            "limit": limit,
+            "order": order,
+            "ascending": "false",
         }
-        if slug:
-            params["slug"] = slug
-        if tag_slug:
-            params["tag_slug"] = tag_slug
-
         try:
             r = requests.get(GAMMA_EVENTS_URL, params=params, timeout=self.REQUEST_TIMEOUT)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            return data if isinstance(data, list) else []
         except requests.RequestException as e:
             logger.warning("Gamma API request failed: %s", e)
             return []
-
-    def _find_btc_15m_event(self) -> Optional[dict]:
-        """
-        Find the BTC 15-minute event.
-        Priority: 1) slug=bitcoin-price-15-minute, 2) tag + title search.
-        """
-        # Try slug first (fallback when Polymarket changes series ID)
-        result = self._fetch_events(slug=BTC_15M_SLUG)
-        if result:
-            ev = result[0] if isinstance(result, list) else result
-            return ev
-
-        # Fallback: fetch with tag and filter by title
-        events = self._fetch_events(tag_slug="bitcoin")
-        for ev in events:
-            title = (ev.get("title") or "").lower()
-            if "15-minute" in title or "15 minute" in title:
-                return ev
-
-        # Also try slug_contains
-        try:
-            r = requests.get(
-                GAMMA_EVENTS_URL,
-                params={
-                    "active": "true",
-                    "closed": "false",
-                    "slug_contains": "bitcoin",
-                    "limit": 50,
-                },
-                timeout=self.REQUEST_TIMEOUT,
-            )
-            r.raise_for_status()
-            for ev in r.json():
-                title = (ev.get("title") or "").lower()
-                slug = (ev.get("slug") or "").lower()
-                if "15-minute" in title or "15 minute" in title or "15-minute" in slug:
-                    return ev
-        except requests.RequestException:
-            pass
-
-        return None
 
     def _parse_clob_token_ids(self, raw: str) -> tuple[str, str]:
         """Parse clobTokenIds JSON string. Returns (yes_token_id, no_token_id)."""
@@ -114,62 +77,86 @@ class Scanner:
             pass
         return "", ""
 
-    def _get_active_market_from_event(self, event: dict) -> Optional[ActiveMarket]:
-        """From event, find the current active (not closed) market with nearest end_date."""
-        markets = event.get("markets") or []
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    def _is_short_term(self, event: dict, market: dict) -> bool:
+        """Return True if market is short-term (15-min, hourly, etc.)."""
+        title = (event.get("title") or "").lower()
+        question = (market.get("question") or "").lower()
+        combined = f"{title} {question}"
+        return any(p in combined for p in EXCLUDE_PATTERNS)
 
-        active_markets = []
-        for m in markets:
-            if m.get("closed"):
-                continue
-            if not m.get("acceptingOrders", True):
-                continue
-            end = m.get("endDate") or m.get("endDateIso") or ""
-            if end and end < now_iso:
-                continue
-            yes_id, no_id = self._parse_clob_token_ids(m.get("clobTokenIds") or "[]")
-            if not yes_id or not no_id:
-                continue
-            active_markets.append((m, end))
+    def _has_preferred_tag(self, event: dict) -> bool:
+        """Check if event has a preferred tag (Crypto, Pop Culture, etc.)."""
+        tags = event.get("tags") or []
+        for t in tags:
+            slug = (t.get("slug") or "").lower()
+            if slug in PREFERRED_TAG_SLUGS:
+                return True
+        return False
 
-        if not active_markets:
+    def _score_market(self, event: dict, market: dict) -> float:
+        """Higher score = better candidate. Prefer volume, preferred tags."""
+        score = 0.0
+        score += float(market.get("volume24hr") or market.get("volumeNum") or 0) / 1e6
+        score += float(event.get("volume24hr") or event.get("volume") or 0) / 1e6
+        if self._has_preferred_tag(event):
+            score += 10.0
+        return score
+
+    def get_active_market(self) -> Optional[ActiveMarket]:
+        """
+        Get the best market with liquidity rewards.
+        Filters: rewards_min_size > 0, accepting orders, not short-term.
+        """
+        events = self._fetch_events(limit=150)
+        best: Optional[tuple[float, dict, dict]] = None
+
+        for event in events:
+            if not event.get("active") or event.get("closed"):
+                continue
+            markets = event.get("markets") or []
+            for m in markets:
+                rewards_min = m.get("rewardsMinSize") or 0
+                try:
+                    rewards_min = int(rewards_min)
+                except (ValueError, TypeError):
+                    rewards_min = 0
+                if rewards_min <= 0:
+                    continue
+                if m.get("closed") or not m.get("acceptingOrders", True):
+                    continue
+                if self._is_short_term(event, m):
+                    continue
+                yes_id, no_id = self._parse_clob_token_ids(m.get("clobTokenIds") or "[]")
+                if not yes_id or not no_id:
+                    continue
+
+                score = self._score_market(event, m)
+                if best is None or score > best[0]:
+                    best = (score, event, m)
+
+        if best is None:
             return None
 
-        # Pick market with earliest end_date (current window)
-        active_markets.sort(key=lambda x: x[1] or "9999")
-        m, end = active_markets[0]
+        _, event, m = best
         yes_id, no_id = self._parse_clob_token_ids(m.get("clobTokenIds") or "[]")
+        rewards_min = int(m.get("rewardsMinSize") or 0)
 
-        return ActiveMarket(
+        market = ActiveMarket(
             event_id=str(event.get("id", "")),
             event_slug=str(event.get("slug", "")),
             market_id=str(m.get("id", "")),
             question=str(m.get("question", "")),
-            end_date_iso=end or "",
+            end_date_iso=str(m.get("endDate") or m.get("endDateIso") or ""),
             yes_token_id=yes_id,
             no_token_id=no_id,
             accepting_orders=bool(m.get("acceptingOrders", True)),
+            rewards_min_size=rewards_min,
         )
-
-    def get_active_market(self) -> Optional[ActiveMarket]:
-        """
-        Get the current active BTC 15-minute market.
-        Returns None if none found (e.g. between windows).
-        """
-        event = self._find_btc_15m_event()
-        if not event:
-            return None
-        self._last_event_data = event
-        market = self._get_active_market_from_event(event)
         self._last_market = market
         return market
 
     def get_market_resolution(self, market_id: str) -> Optional[bool]:
-        """
-        Fetch resolved market from Gamma API.
-        Returns True if Yes won, False if No won, None if not resolved or error.
-        """
+        """Fetch resolved market from Gamma API. Returns True if Yes won, False if No won."""
         url = f"{GAMMA_API_URL}/markets/{market_id}"
         try:
             r = requests.get(url, timeout=self.REQUEST_TIMEOUT)
@@ -189,12 +176,3 @@ class Scanner:
         except Exception as e:
             logger.warning("Could not fetch market resolution for %s: %s", market_id, e)
             return None
-
-    def poll_until_market(self) -> ActiveMarket:
-        """Block until an active market is available."""
-        while True:
-            m = self.get_active_market()
-            if m:
-                return m
-            logger.info("No active BTC 15m market. Retrying in %ds...", self.POLL_INTERVAL)
-            time.sleep(self.POLL_INTERVAL)

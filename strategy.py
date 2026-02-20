@@ -1,90 +1,71 @@
 """
-Latency Arbitrage Strategy.
-Lead: Binance BTC price. Lag: Polymarket Yes share price.
-Trigger: Binance jump >0.1%, Polymarket stale, EV > 1.02.
+Passive Market Making Strategy.
+Symmetrical Post-Only Limit Orders on both sides of the book.
+Yes bid at mid_price - target_spread, No bid at (1 - mid_price) - target_spread.
 """
 
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from py_clob_client.clob_types import OrderArgs, OrderType
-
-from config import BINANCE_JUMP_THRESHOLD_PCT, EV_THRESHOLD
+from config import TARGET_SPREAD
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TradeSignal:
-    """Signal to place a post-only limit order."""
+class QuoteSignal:
+    """Signal to place a post-only bid on Yes or No."""
 
-    token_id: str  # Yes token
+    token_id: str
     side: str  # "BUY"
+    outcome: str  # "Yes" or "No"
     price: float
-    size: float  # in USDC
-    ev: float
+    size: float
 
 
-class LatencyArbitrageStrategy:
+class MarketMakerStrategy:
     """
-    When Binance jumps >threshold but Polymarket Yes hasn't moved,
-    compute EV. If EV > threshold, emit buy signal (post-only).
+    Calculates symmetrical quotes around mid_price.
+    Yes bid = mid - spread, No bid = (1 - mid) - spread.
     """
 
-    def __init__(
-        self,
-        jump_threshold_pct: float = BINANCE_JUMP_THRESHOLD_PCT,
-        ev_threshold: float = EV_THRESHOLD,
-    ):
-        self.jump_threshold_pct = jump_threshold_pct
-        self.ev_threshold = ev_threshold
-        self._last_poly_yes_price: Optional[float] = None
-        self._poly_price_stale_threshold = 0.0005  # consider "not moved" if change < this
+    def __init__(self, target_spread: float = TARGET_SPREAD):
+        self.target_spread = target_spread
 
-    def check_signal(
+    def get_quotes(
         self,
+        mid_price: float,
         yes_token_id: str,
-        binance_price: float,
-        binance_prev_price: Optional[float],
-        binance_change_pct: Optional[float],
-        poly_yes_price: float,
-        position_size_usd: float,
-    ) -> Optional[TradeSignal]:
+        no_token_id: str,
+        size: float,
+        quote_yes: bool = True,
+        quote_no: bool = True,
+    ) -> list["QuoteSignal"]:
         """
-        Check if we should place a BUY order on Yes.
-        - Binance must have jumped > jump_threshold_pct
-        - Polymarket Yes price considered stale (we use current as baseline for simplicity)
-        - EV = (implied_win_prob) / yes_price > ev_threshold
+        Return list of QuoteSignals for symmetrical bids.
+        quote_yes/quote_no: set False if inventory limit reached on that side.
         """
-        if poly_yes_price <= 0 or poly_yes_price >= 1:
-            return None
+        if mid_price <= 0 or mid_price >= 1:
+            return []
+        signals = []
+        yes_bid = round(mid_price - self.target_spread, 3)
+        no_bid = round((1.0 - mid_price) - self.target_spread, 3)
 
-        # Need positive Binance move
-        if binance_change_pct is None or binance_change_pct < self.jump_threshold_pct:
-            return None
-
-        # Implied win prob: bump based on Binance lead. More jump -> higher implied
-        bump = min(0.08, (binance_change_pct / 100) * 2)  # e.g. 0.2% move -> 0.004 bump
-        implied_prob = min(0.99, poly_yes_price + bump)
-
-        # EV = payout if win / cost. Cost = price, payout = 1. So EV = implied_prob / price
-        ev = implied_prob / poly_yes_price if poly_yes_price > 0 else 0
-
-        if ev < self.ev_threshold:
-            return None
-
-        # Size: position_size_usd / price = number of shares
-        num_shares = position_size_usd / poly_yes_price
-        # Round to 2 decimals for order size
-        size = round(num_shares, 2)
-        if size < 1:
-            return None
-
-        return TradeSignal(
-            token_id=yes_token_id,
-            side="BUY",
-            price=round(poly_yes_price, 3),
-            size=size,
-            ev=ev,
-        )
+        if quote_yes and 0.01 <= yes_bid <= 0.99 and size >= 1:
+            signals.append(QuoteSignal(
+                token_id=yes_token_id,
+                side="BUY",
+                outcome="Yes",
+                price=yes_bid,
+                size=size,
+            ))
+        if quote_no and 0.01 <= no_bid <= 0.99 and size >= 1:
+            signals.append(QuoteSignal(
+                token_id=no_token_id,
+                side="BUY",
+                outcome="No",
+                price=no_bid,
+                size=size,
+            ))
+        return signals

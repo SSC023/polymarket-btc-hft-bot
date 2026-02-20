@@ -1,53 +1,45 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC 15-Minute HFT Bot.
-24/7 latency arbitrage: Binance lead → Polymarket lag.
+Polymarket Passive Market Making Bot.
+24/7 liquidity provision on markets with rewards. Symmetrical quotes around mid_price.
 """
 
 import sys
-import threading
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Set
 
 from rich.console import Console
 from rich.live import Live
 
-from binance_feed import BinancePriceFeed
 from config import POSITION_SIZE_USD, CIRCUIT_BREAKER_LOSS_USD
 from dashboard import create_dashboard, format_time_left
-from execution import ExecutionEngine
+from order_book_feed import OrderBookFeed
+from execution import OrderManager
 from auth import create_clob_client
 from scanner import Scanner, ActiveMarket
-from strategy import LatencyArbitrageStrategy, TradeSignal
+from strategy import MarketMakerStrategy, QuoteSignal
 
 from logger import setup_logging
 from analytics import CSVLogger
 import logging
 
-# Optional: web3 for POL balance
 try:
     from web3 import Web3
     WEB3_AVAILABLE = True
 except ImportError:
     WEB3_AVAILABLE = False
 
-# Configure logging (file + console) - must run before other imports use logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
-# Polygon RPC for balance checks
 POLYGON_RPC = "https://polygon-rpc.com"
 
 
 @dataclass
 class BotState:
-    """Shared state for dashboard and strategy."""
-
     market: Optional[ActiveMarket] = None
-    btc_price: Optional[float] = None
-    poly_yes_price: Optional[float] = None
+    mid_price: Optional[float] = None
     session_pnl: float = 0.0
     usdc_balance: Optional[float] = None
     pol_balance: Optional[float] = None
@@ -56,7 +48,6 @@ class BotState:
 
 
 def fetch_usdc_balance(client) -> Optional[float]:
-    """Get USDC balance from CLOB."""
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -67,7 +58,7 @@ def fetch_usdc_balance(client) -> Optional[float]:
                     v = resp[key]
                     if isinstance(v, (int, float)):
                         return float(v)
-                    if isinstance(v, str) and v.replace(".", "").isdigit():
+                    if isinstance(v, str) and v.replace(".", "").replace("-", "").replace(".", "", 1).isdigit():
                         return float(v)
             if "balances" in resp:
                 for b in resp["balances"]:
@@ -80,23 +71,18 @@ def fetch_usdc_balance(client) -> Optional[float]:
 
 
 def fetch_pol_balance(address: str) -> Optional[float]:
-    """Get native POL balance on Polygon."""
     if not WEB3_AVAILABLE or not address:
         return None
     try:
         w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-        balance_wei = w3.eth.get_balance(address)
-        return w3.from_wei(balance_wei, "ether")
-    except Exception as e:
-        logger.debug("POL balance fetch failed: %s", e)
+        return w3.from_wei(w3.eth.get_balance(address), "ether")
+    except Exception:
         return None
 
 
 def run_bot():
-    """Main bot loop with dashboard."""
     console = Console()
 
-    # Auth
     try:
         client = create_clob_client()
     except ValueError as e:
@@ -104,57 +90,55 @@ def run_bot():
         sys.exit(1)
 
     address = client.get_address()
-    engine = ExecutionEngine(client)
+    manager = OrderManager(client)
     scanner = Scanner()
-    strategy = LatencyArbitrageStrategy()
-    feed = BinancePriceFeed()
+    strategy = MarketMakerStrategy()
     analytics = CSVLogger()
 
     state = BotState()
-    # Pending positions per market: market_id -> [(share_price, size, ev), ...]
-    pending_positions: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
+    feed: Optional[OrderBookFeed] = None
     last_pnl_sample_time = 0.0
-    pnl_sample_interval = 10.0  # seconds between sparkline samples
+    pnl_sample_interval = 10.0
+    last_trade_ids: Set[str] = set()
 
     def update_balances():
         state.usdc_balance = fetch_usdc_balance(client)
         if address:
             state.pol_balance = fetch_pol_balance(address)
 
-    # Cancel stale orders before starting
     console.print("[yellow]Canceling any stale orders...[/yellow]")
-    engine.cancel_all_orders()
+    manager.cancel_all_orders()
     update_balances()
 
-    # Start Binance feed
-    feed.start()
-    console.print("[green]Binance price feed started.[/green]")
-
     # Find initial market
-    console.print("[yellow]Scanning for BTC 15m market...[/yellow]")
+    console.print("[yellow]Scanning for liquidity rewards market...[/yellow]")
     market = scanner.get_active_market()
     if not market:
-        console.print(
-            "[red]No active BTC 15-minute market found. "
-            "If Polymarket changed the series, set BTC_15M_SLUG in .env (e.g. bitcoin-price-15-minute)[/red]"
-        )
-        feed.stop()
+        console.print("[red]No market with liquidity rewards found.[/red]")
         sys.exit(1)
 
     state.market = market
     console.print(f"[green]Active market: {market.question}[/green]")
 
-    last_market_id = market.market_id
-    strategy_check_interval = 2.0
+    feed = OrderBookFeed(market.yes_token_id, market.no_token_id)
+    feed.start()
+    console.print("[green]Order book feed started.[/green]")
+
+    strategy_check_interval = 3.0
     last_strategy_check = 0.0
     dashboard_refresh = 0.5
 
     def get_dashboard_state():
+        yes_bid = manager.active_yes_bid
+        no_bid = manager.active_no_bid
         return {
             "market_name": state.market.question if state.market else "",
             "market_time_left": format_time_left(state.market.end_date_iso) if state.market else "",
-            "btc_binance": state.btc_price,
-            "poly_implied": state.poly_yes_price,
+            "mid_price": state.mid_price,
+            "active_yes_bid": yes_bid,
+            "active_no_bid": no_bid,
+            "inventory_yes": manager.inventory_yes,
+            "inventory_no": manager.inventory_no,
             "session_pnl": state.session_pnl,
             "usdc_balance": state.usdc_balance,
             "pol_balance": float(state.pol_balance) if state.pol_balance is not None else None,
@@ -163,7 +147,21 @@ def run_bot():
         }
 
     def render():
-        return create_dashboard(**get_dashboard_state())
+        s = get_dashboard_state()
+        return create_dashboard(
+            market_name=s["market_name"],
+            market_time_left=s["market_time_left"],
+            mid_price=s["mid_price"],
+            active_yes_bid=s["active_yes_bid"],
+            active_no_bid=s["active_no_bid"],
+            inventory_yes=s["inventory_yes"],
+            inventory_no=s["inventory_no"],
+            session_pnl=s["session_pnl"],
+            usdc_balance=s["usdc_balance"],
+            pol_balance=s["pol_balance"],
+            circuit_breaker=s["circuit_breaker"],
+            pnl_history=s["pnl_history"],
+        )
 
     try:
         with Live(render(), console=console, refresh_per_second=2) as live:
@@ -171,97 +169,93 @@ def run_bot():
                 time.sleep(dashboard_refresh)
                 now = time.monotonic()
 
-                # Circuit breaker
-                if engine.circuit_breaker_tripped:
+                if manager.circuit_breaker_tripped:
                     state.circuit_breaker = True
                     live.update(render())
-                    console.print("[bold red]CIRCUIT BREAKER: Bot stopped. Daily loss limit reached.[/bold red]")
+                    console.print("[bold red]CIRCUIT BREAKER: Bot stopped.[/bold red]")
                     break
 
-                # Update prices
-                state.btc_price = feed.price
-                state.session_pnl = engine.session_pnl
+                state.mid_price = feed.mid_price
+                state.session_pnl = manager.session_pnl
 
-                # Sample P&L for sparkline (throttled)
                 if now - last_pnl_sample_time >= pnl_sample_interval:
                     last_pnl_sample_time = now
                     state.pnl_history.append(state.session_pnl)
                     if len(state.pnl_history) > 48:
                         state.pnl_history = state.pnl_history[-48:]
 
-                # Market switch: has current market ended?
-                market = scanner.get_active_market()
-                if market and market.market_id != last_market_id:
-                    # Resolve previous market and log P&L
-                    if last_market_id and last_market_id in pending_positions:
-                        resolution = scanner.get_market_resolution(last_market_id)
-                        btc_at_resolve = state.btc_price or 0
-                        for share_price, size, ev in pending_positions[last_market_id]:
-                            pnl = analytics.log_market_resolved(
-                                market_id=last_market_id,
-                                btc_price=btc_at_resolve,
-                                share_price_bought=share_price,
-                                ev_at_execution=ev,
-                                result_yes_won=resolution,
-                                size=size,
-                            )
-                            engine.record_pnl(pnl)
-                        pending_positions.pop(last_market_id, None)
-                        logger.info("Market %s resolved, logged to trade_history.csv", last_market_id)
+                # Re-scan market periodically (in case we need to switch)
+                if int(now) % 60 < 2:
+                    m = scanner.get_active_market()
+                    if m and m.market_id != (state.market.market_id if state.market else ""):
+                        state.market = m
+                        manager.cancel_all_orders()
+                        if feed:
+                            feed.stop()
+                        feed = OrderBookFeed(m.yes_token_id, m.no_token_id)
+                        feed.start()
+                        logger.info("Switched to market: %s", m.question)
 
-                    last_market_id = market.market_id
-                    state.market = market
-                    engine.cancel_all_orders()
-                    logger.info("Switched to new market: %s", market.question)
+                # Mid-price drift: cancel and re-quote
+                if state.mid_price is not None and manager.should_requote(state.mid_price):
+                    manager.cancel_all_orders()
+                    manager.set_last_mid(state.mid_price)
+                    logger.info("Mid drifted, re-quoting at %.3f", state.mid_price)
 
-                state.market = market or state.market
-
-                # Fetch Polymarket Yes price
-                if state.market and state.market.accepting_orders:
-                    try:
-                        mid = client.get_midpoint(state.market.yes_token_id)
-                        state.poly_yes_price = float(mid) if mid is not None else None
-                    except Exception:
-                        state.poly_yes_price = None
-
-                # Strategy check (throttled)
+                # Strategy: place symmetrical quotes
                 if now - last_strategy_check >= strategy_check_interval and state.market:
                     last_strategy_check = now
                     if (
-                        state.btc_price
-                        and state.poly_yes_price
+                        state.mid_price
                         and state.market.accepting_orders
                         and not state.circuit_breaker
                     ):
-                        signal = strategy.check_signal(
-                            yes_token_id=state.market.yes_token_id,
-                            binance_price=state.btc_price,
-                            binance_prev_price=feed.prev_price,
-                            binance_change_pct=feed.price_change_pct(),
-                            poly_yes_price=state.poly_yes_price,
-                            position_size_usd=POSITION_SIZE_USD,
+                        manager.set_last_mid(state.mid_price)
+                        size = round(POSITION_SIZE_USD / max(state.mid_price, 0.1), 2)
+                        quotes = strategy.get_quotes(
+                            state.mid_price,
+                            state.market.yes_token_id,
+                            state.market.no_token_id,
+                            size=min(size, 20),
+                            quote_yes=manager.can_quote_yes(),
+                            quote_no=manager.can_quote_no(),
                         )
-                        if signal:
-                            placed = engine.place_post_only_limit_order(
-                                token_id=signal.token_id,
-                                side=signal.side,
-                                price=signal.price,
-                                size=signal.size,
+                        for q in quotes:
+                            placed = manager.place_post_only_limit_order(
+                                token_id=q.token_id,
+                                side=q.side,
+                                price=q.price,
+                                size=q.size,
+                                outcome=q.outcome,
                             )
                             if placed:
-                                analytics.log_trade_executed(
-                                    market_id=state.market.market_id,
-                                    btc_price=state.btc_price,
-                                    share_price_bought=signal.price,
-                                    ev_at_execution=signal.ev,
-                                    size=signal.size,
+                                analytics.log_order_placed(
+                                    state.market.market_id,
+                                    q.outcome,
+                                    q.price,
+                                    q.size,
                                 )
-                                pending_positions[state.market.market_id].append(
-                                    (signal.price, signal.size, signal.ev)
-                                )
-                                logger.info("Order placed: %s @ %.3f x %.2f (EV=%.3f)", signal.side, signal.price, signal.size, signal.ev)
 
-                # Periodic balance update
+                # Poll for fills (best-effort)
+                if int(now) % 30 == 0 and state.market:
+                    try:
+                        trades = client.get_trades()
+                        for t in (trades or [])[:20]:
+                            tid = t.get("id") or t.get("trade_id") or str(t)
+                            if tid and tid not in last_trade_ids:
+                                last_trade_ids.add(tid)
+                                if len(last_trade_ids) > 500:
+                                    last_trade_ids.clear()
+                                aid = str(t.get("asset_id") or t.get("token_id") or "")
+                                outcome = "Yes" if aid == state.market.yes_token_id else "No"
+                                price = float(t.get("price", 0) or 0)
+                                size = float(t.get("size", t.get("amount", 0)) or 0)
+                                if price > 0 and size > 0:
+                                    analytics.log_passive_fill(state.market.market_id, outcome, price, size)
+                                    manager.record_fill(outcome, size, price)
+                    except Exception as e:
+                        logger.debug("Trade poll: %s", e)
+
                 if int(now) % 30 < 1:
                     update_balances()
 
@@ -270,8 +264,9 @@ def run_bot():
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
-        feed.stop()
-        engine.cancel_all_orders()
+        if feed:
+            feed.stop()
+        manager.cancel_all_orders()
 
 
 if __name__ == "__main__":

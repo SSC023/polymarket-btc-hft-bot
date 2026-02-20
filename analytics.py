@@ -1,6 +1,7 @@
 """
 Analytics and persistent trade logging for post-trade analysis.
 CSVLogger appends to trade_history.csv for pivot tables and forecasting.
+Logs passive limit order fills (market making).
 """
 
 import csv
@@ -15,9 +16,10 @@ DEFAULT_CSV_PATH = "trade_history.csv"
 CSV_HEADERS = [
     "Timestamp",
     "Market_ID",
-    "BTC_Price",
+    "Outcome",
     "Share_Price_Bought",
-    "EV_at_Execution",
+    "Size",
+    "Order_Type",
     "Result",
     "PnL",
     "Cumulative_PnL",
@@ -27,7 +29,7 @@ CSV_HEADERS = [
 class CSVLogger:
     """
     Thread-safe CSV logger for trade events.
-    Appends rows on trade execution and market resolution.
+    Logs passive limit order fills. Market resolution PnL tracked separately.
     """
 
     def __init__(self, filepath: Optional[str] = None):
@@ -37,7 +39,6 @@ class CSVLogger:
         self._ensure_header()
 
     def _ensure_header(self) -> None:
-        """Create file with headers if it doesn't exist."""
         with self._lock:
             if not self._path.exists():
                 with open(self._path, "w", newline="", encoding="utf-8") as f:
@@ -45,32 +46,51 @@ class CSVLogger:
                     writer.writerow(CSV_HEADERS)
 
     def _append_row(self, row: dict) -> None:
-        """Append a single row to the CSV."""
         with self._lock:
             with open(self._path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
                 writer.writerow({k: row.get(k, "") for k in CSV_HEADERS})
 
-    def log_trade_executed(
+    def log_order_placed(
         self,
         market_id: str,
-        btc_price: float,
-        share_price_bought: float,
-        ev_at_execution: float,
+        outcome: str,
+        share_price: float,
+        size: float,
+    ) -> None:
+        """Log when a passive limit order is placed (pre-fill)."""
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        self._append_row({
+            "Timestamp": timestamp,
+            "Market_ID": str(market_id),
+            "Outcome": outcome,
+            "Share_Price_Bought": f"{share_price:.4f}",
+            "Size": f"{size:.2f}",
+            "Order_Type": "PASSIVE_MM",
+            "Result": "PLACED",
+            "PnL": "0.00",
+            "Cumulative_PnL": f"{self._cumulative_pnl:.2f}",
+        })
+
+    def log_passive_fill(
+        self,
+        market_id: str,
+        outcome: str,
+        share_price: float,
         size: float,
     ) -> None:
         """
-        Log when a trade is executed.
-        Result=EXECUTED, PnL=0 (not yet realized).
+        Log when a passive limit order is filled (market making).
         """
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         self._append_row({
             "Timestamp": timestamp,
             "Market_ID": str(market_id),
-            "BTC_Price": f"{btc_price:.2f}",
-            "Share_Price_Bought": f"{share_price_bought:.4f}",
-            "EV_at_Execution": f"{ev_at_execution:.4f}",
-            "Result": "EXECUTED",
+            "Outcome": outcome,
+            "Share_Price_Bought": f"{share_price:.4f}",
+            "Size": f"{size:.2f}",
+            "Order_Type": "PASSIVE_MM",
+            "Result": "FILLED",
             "PnL": "0.00",
             "Cumulative_PnL": f"{self._cumulative_pnl:.2f}",
         })
@@ -78,17 +98,13 @@ class CSVLogger:
     def log_market_resolved(
         self,
         market_id: str,
-        btc_price: float,
         share_price_bought: float,
-        ev_at_execution: float,
         result_yes_won: Optional[bool],
         size: float,
     ) -> float:
         """
-        Log when a 15-minute market resolves.
-        Computes PnL: Win = size * (1 - share_price), Loss = -size * share_price.
-        result_yes_won: True/False for Win/Loss, None for UNKNOWN (PnL=0).
-        Returns the PnL for this position.
+        Log when a market resolves. Computes PnL for Yes position.
+        Returns the PnL.
         """
         if result_yes_won is True:
             pnl = size * (1.0 - share_price_bought)
@@ -106,9 +122,10 @@ class CSVLogger:
         self._append_row({
             "Timestamp": timestamp,
             "Market_ID": str(market_id),
-            "BTC_Price": f"{btc_price:.2f}",
+            "Outcome": "Yes",
             "Share_Price_Bought": f"{share_price_bought:.4f}",
-            "EV_at_Execution": f"{ev_at_execution:.4f}",
+            "Size": f"{size:.2f}",
+            "Order_Type": "PASSIVE_MM",
             "Result": result_str,
             "PnL": f"{pnl:.2f}",
             "Cumulative_PnL": f"{self._cumulative_pnl:.2f}",
